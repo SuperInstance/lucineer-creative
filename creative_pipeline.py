@@ -99,7 +99,7 @@ class MMX:
                 text=True,
                 timeout=timeout,
             )
-        except subprocess.TimeoutError:
+        except subprocess.TimeoutExpired:
             return {"_error": f"mmx timed out after {timeout}s"}
         except FileNotFoundError:
             return {"_error": f"mmx binary not found: {self.bin}"}
@@ -130,7 +130,7 @@ class MMX:
                 timeout=timeout,
             )
             return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
-        except subprocess.TimeoutError:
+        except subprocess.TimeoutExpired:
             return 5, "", f"mmx timed out after {timeout}s"
         except FileNotFoundError:
             return 1, "", f"mmx binary not found: {self.bin}"
