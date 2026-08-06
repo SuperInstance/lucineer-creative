@@ -59,6 +59,8 @@ class CreativeAsset:
     label: str         # human-friendly name
     filename: str      # relative path under assets/
     mmx_url: str = ""  # MiniMax CDN url (if available)
+    status: str = "ok"  # "ok" | "failed" | "skipped"
+    error: str = ""    # error message if status == "failed"
     meta: dict = field(default_factory=dict)
 
 
@@ -77,6 +79,28 @@ class PipelineResult:
             "build_plan": self.build_plan,
         }, indent=2, ensure_ascii=False)
 
+    @property
+    def successful_assets(self) -> list[CreativeAsset]:
+        """Assets that completed successfully."""
+        return [a for a in self.assets if a.status == "ok" and a.filename]
+
+    @property
+    def failed_assets(self) -> list[CreativeAsset]:
+        """Assets that failed."""
+        return [a for a in self.assets if a.status == "failed"]
+
+    @property
+    def summary(self) -> dict:
+        """Quick summary for logging/history."""
+        return {
+            "request": self.request,
+            "timestamp": self.timestamp,
+            "total": len(self.assets),
+            "succeeded": len(self.successful_assets),
+            "failed": len(self.failed_assets),
+            "had_plan": self.build_plan is not None,
+        }
+
 
 # ── MMX Wrapper ──────────────────────────────────────────────────────────────
 
@@ -89,35 +113,52 @@ class MMX:
             # Fall back to PATH lookup
             self.bin = "mmx"
 
-    def _run(self, args: list[str], timeout: int = 300) -> dict:
-        """Run mmx with JSON output and parse the result."""
+    def _run(self, args: list[str], timeout: int = 300, retries: int = 2) -> dict:
+        """Run mmx with JSON output and parse the result. Retries on transient failures."""
         cmd = [self.bin] + args + MMX_COMMON_FLAGS
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            return {"_error": f"mmx timed out after {timeout}s"}
-        except FileNotFoundError:
-            return {"_error": f"mmx binary not found: {self.bin}"}
+        last_error = {}
+        for attempt in range(retries + 1):
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                last_error = {"_error": f"mmx timed out after {timeout}s"}
+                if attempt < retries:
+                    wait = 2 ** attempt  # 1s, 2s, 4s...
+                    time.sleep(wait)
+                    continue
+                return last_error
+            except FileNotFoundError:
+                return {"_error": f"mmx binary not found: {self.bin}"}
 
-        if proc.returncode != 0:
-            return {
-                "_error": f"mmx exit {proc.returncode}",
-                "stderr": proc.stderr.strip(),
-            }
+            if proc.returncode != 0:
+                last_error = {
+                    "_error": f"mmx exit {proc.returncode}",
+                    "stderr": proc.stderr.strip(),
+                }
+                if attempt < retries:
+                    wait = 2 ** attempt
+                    time.sleep(wait)
+                    continue
+                return last_error
 
-        stdout = proc.stdout.strip()
-        if not stdout:
-            return {"_error": "mmx returned empty output"}
-        try:
-            return json.loads(stdout)
-        except json.JSONDecodeError:
-            # Some commands output plain text even with --output json
-            return {"_raw": stdout}
+            stdout = proc.stdout.strip()
+            if not stdout:
+                last_error = {"_error": "mmx returned empty output"}
+                if attempt < retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                return last_error
+            try:
+                return json.loads(stdout)
+            except json.JSONDecodeError:
+                # Some commands output plain text even with --output json
+                return {"_raw": stdout}
+        return last_error
 
     def _run_file(self, args: list[str], timeout: int = 300) -> tuple[int, str, str]:
         """Run mmx with file output (no JSON parsing). Returns (rc, stdout, stderr)."""
@@ -458,9 +499,65 @@ def run_pipeline(
 
     print(f"\n✅ Pipeline complete! Assets saved to {build_dir}/", file=sys.stderr)
     print(f"   Manifest: {manifest_path}", file=sys.stderr)
+    print(f"   Assets: {len(result.successful_assets)} ok, {len(result.failed_assets)} failed", file=sys.stderr)
     print(file=sys.stderr)
 
+    # ── Update asset history ─────────────────────────────────────────────
+    _update_history(result)
+
     return result
+
+
+# ── Asset History ────────────────────────────────────────────────────────────
+
+HISTORY_FILE = ASSETS_DIR / "history.jsonl"
+
+
+def _update_history(result: PipelineResult) -> None:
+    """Append a pipeline run summary to the history file."""
+    ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+    entry = json.dumps(result.summary, ensure_ascii=False)
+    with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+        f.write(entry + "\n")
+
+
+def load_history(limit: int = 50) -> list[dict]:
+    """Load recent pipeline runs from history."""
+    if not HISTORY_FILE.exists():
+        return []
+    lines = HISTORY_FILE.read_text(encoding="utf-8").strip().split("\n")
+    entries = []
+    for line in reversed(lines):
+        if line.strip():
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        if len(entries) >= limit:
+            break
+    return entries
+
+
+# ── Batch Mode ───────────────────────────────────────────────────────────────
+
+def run_batch(requests: list[str], **kwargs) -> list[PipelineResult]:
+    """Run the pipeline for multiple build requests. Returns all results."""
+    results = []
+    total = len(requests)
+    for i, req in enumerate(requests, 1):
+        print(f"\n{'='*60}", file=sys.stderr)
+        print(f"  Batch {i}/{total}: {req}", file=sys.stderr)
+        print(f"{'='*60}", file=sys.stderr)
+        try:
+            result = run_pipeline(req, **kwargs)
+            results.append(result)
+        except Exception as e:
+            print(f"  ❌ Batch item {i} failed: {e}", file=sys.stderr)
+            results.append(PipelineResult(
+                request=req,
+                timestamp=time.strftime("%Y%m%d-%H%M%S"),
+            ))
+    return results
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -475,6 +572,8 @@ Examples:
   python3 creative_pipeline.py "medieval castle on a hill" --skip-video
   python3 creative_pipeline.py "cyberpunk city" --with-video --with-speech
   python3 creative_pipeline.py "fantasy potion shop" --with-vision-check
+  python3 creative_pipeline.py --batch builds.txt
+  python3 creative_pipeline.py --history
 
 Output:
   Prints a JSON summary to stdout.
@@ -483,7 +582,17 @@ Output:
     )
     parser.add_argument(
         "request",
+        nargs="?",
+        default=None,
         help='The build request, e.g. "build a spooky forest"',
+    )
+    parser.add_argument(
+        "--batch", metavar="FILE",
+        help="Run pipeline for each line in the given file",
+    )
+    parser.add_argument(
+        "--history", action="store_true",
+        help="Show recent pipeline run history",
     )
     parser.add_argument(
         "--skip-video", action="store_true", default=True,
@@ -511,6 +620,46 @@ Output:
     )
 
     args = parser.parse_args()
+
+    # ── History mode ─────────────────────────────────────────────
+    if args.history:
+        history = load_history()
+        if not history:
+            print("No pipeline runs in history.")
+        else:
+            print(f"Recent pipeline runs ({len(history)}):\n")
+            for entry in history:
+                status = f"{entry['succeeded']}/{entry['total']} ok"
+                plan = "✓" if entry.get("had_plan") else "✗"
+                print(f"  [{entry['timestamp']}] {entry['request'][:50]}  {status}  plan:{plan}")
+        return
+
+    # ── Batch mode ───────────────────────────────────────────────
+    if args.batch:
+        batch_file = Path(args.batch)
+        if not batch_file.exists():
+            print(f"Error: batch file not found: {batch_file}", file=sys.stderr)
+            sys.exit(1)
+        requests = [line.strip() for line in batch_file.read_text().splitlines() if line.strip() and not line.startswith("#")]
+        if not requests:
+            print("Error: batch file is empty", file=sys.stderr)
+            sys.exit(1)
+        skip_video = args.skip_video and not args.with_video
+        results = run_batch(
+            requests,
+            skip_video=skip_video,
+            with_speech=args.with_speech,
+            with_vision_check=args.with_vision_check,
+        )
+        indent = None if args.compact else 2
+        summaries = [r.summary for r in results]
+        print(json.dumps(summaries, indent=indent, ensure_ascii=False))
+        return
+
+    # ── Single request mode ──────────────────────────────────────
+    if not args.request:
+        parser.print_help()
+        sys.exit(1)
 
     skip_video = args.skip_video and not args.with_video
 
